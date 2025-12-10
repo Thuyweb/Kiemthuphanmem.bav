@@ -6,6 +6,7 @@ Conftest hoàn chỉnh cho dự án Bookworms Store
 - Parse Test Data -> TD_<key>
 - Auto-detect View & Category (Performance/Functional) và UI vs UX detection (heuristics)
 - Ghi kết quả vào test_results_master.xlsx
+- NOTE: File này đã được chỉnh để chỉ lưu một cột duy nhất: "Category"
 """
 import os
 import re
@@ -364,116 +365,172 @@ def auto_detect_type_and_view(item, pretty_id, duration_s, driver_obj=None, meta
 
 
 # --------------------------
-# Detect UI vs UX (heuristics)
+# Detect UI vs UX (improved heuristics)
+# Returns tuple: (result_str, debug_text)
+# result_str in {"UI", "UX", ""} ; debug_text is human-readable explanation
 # --------------------------
 def detect_ui_or_ux(item, pretty_id, driver_obj=None, meta=None, test_steps=None, test_case_desc=""):
-    ui_score = 0
-    ux_score = 0
-    doc = ""
-    src_l = ""
+    def word_in_text(word, text):
+        try:
+            return bool(re.search(rf"\b{re.escape(word)}\b", text, flags=re.IGNORECASE))
+        except Exception:
+            return False
+
+    ui_score = 0.0
+    ux_score = 0.0
+    reasons = []
+
+    # 0) explicit marker
     try:
-        for m in item.iter_markers():
-            if m.name == "tc" and m.kwargs:
-                t = m.kwargs.get("type") or m.kwargs.get("test_type") or m.kwargs.get("kind")
-                if t:
-                    t_l = str(t).lower()
-                    if "ui" in t_l and "ux" not in t_l:
-                        return "UI"
-                    if "ux" in t_l and "ui" not in t_l:
-                        return "UX"
+        for m in getattr(item, "iter_markers", lambda *a, **k: [])():
+            if getattr(m, "name", "") == "tc" and getattr(m, "kwargs", None):
+                for key in ("type", "test_type", "kind"):
+                    if key in m.kwargs and m.kwargs[key]:
+                        val = str(m.kwargs[key]).lower()
+                        if "ui" in val and "ux" not in val:
+                            return "UI", "Marker explicit type=UI"
+                        if "ux" in val and "ui" not in val:
+                            return "UX", "Marker explicit type=UX"
     except Exception:
         pass
+
+    # 1) docstring Type:
     try:
         doc = inspect.getdoc(getattr(item, "obj", None)) or ""
-        for line in doc.splitlines():
-            if ":" in line:
+        if doc:
+            for line in doc.splitlines():
+                if ":" not in line:
+                    continue
                 k, v = line.split(":", 1)
                 if k.strip().lower() == "type":
                     val = v.strip().lower()
                     if "ui" in val and "ux" not in val:
-                        return "UI"
+                        return "UI", "Docstring Type: UI"
                     if "ux" in val and "ui" not in val:
-                        return "UX"
+                        return "UX", "Docstring Type: UX"
     except Exception:
         pass
+
+    # 2) keywords weights
+    ui_keywords = {
+        "ui": 3, "visual": 3, "layout": 2, "pixel": 3, "css": 2, "color": 2, "font": 1,
+        "responsive": 2, "visual-regression": 3, "screenshot": 2, "imagehash": 2
+    }
+    ux_keywords = {
+        "ux": 3, "flow": 2, "journey": 2, "usability": 3, "accessibility": 3, "a11y": 3,
+        "task": 1, "scenario": 1, "navigation": 1, "conversion": 1
+    }
+
+    # 3) name & doc analysis
     try:
-        name = getattr(item, "name", "") or item.nodeid
-        name_l = (name or "").lower()
+        name = getattr(item, "name", "") or (getattr(item, "nodeid", "") or "")
+        name_l = str(name).lower()
         doc_l = (doc or "").lower()
-        ui_keys = ["ui", "visual", "layout", "pixel", "css", "color", "font", "responsive", "visual-regression"]
-        ux_keys = ["ux", "flow", "journey", "usability", "accessibility", "a11y", "task", "scenario"]
-        for k in ui_keys:
-            if k in name_l or k in doc_l:
-                ui_score += 2
-        for k in ux_keys:
-            if k in name_l or k in doc_l:
-                ux_score += 2
+        for k, w in ui_keywords.items():
+            if word_in_text(k, name_l) or word_in_text(k, doc_l):
+                ui_score += w
+                reasons.append(f"UI keyword '{k}' in name/doc (+{w})")
+        for k, w in ux_keywords.items():
+            if word_in_text(k, name_l) or word_in_text(k, doc_l):
+                ux_score += w
+                reasons.append(f"UX keyword '{k}' in name/doc (+{w})")
     except Exception:
         pass
+
+    # 4) source analysis
+    src_l = ""
     try:
         src = inspect.getsource(getattr(item, "obj", item))
         src_l = src.lower()
-        ui_patterns = [
-            ".value_of_css_property(", ".size", ".location", ".rect", ".screenshot(", "pixel", "imagehash",
-            "get_css", "get_attribute('style')", "get_attribute(\"style\")", "style."
-        ]
-        ux_patterns = ["assert 'success' in", "assert 'error' in", "current_url", "title", "click()", "send_keys(", "wait.until", "axe.run", "accessibility", "a11y"]
-        for p in ui_patterns:
+        ui_code_patterns = {
+            "value_of_css_property": 3,
+            "get_attribute('style')": 2,
+            ".screenshot(": 2,
+            "pixel": 2,
+            "imagehash": 2,
+            ".rect": 1,
+            ".size": 1
+        }
+        ux_code_patterns = {
+            "click()": 2,
+            "send_keys(": 1,
+            "current_url": 2,
+            "title": 1,
+            "wait.until": 2,
+            "assert 'success'": 1,
+            "assert 'error'": 1,
+            "axe.run": 3,
+            "accessibility": 3
+        }
+        for p, w in ui_code_patterns.items():
             if p in src_l:
-                ui_score += 2
-        for p in ux_patterns:
+                ui_score += w
+                reasons.append(f"UI code pattern '{p}' (+{w})")
+        for p, w in ux_code_patterns.items():
             if p in src_l:
-                ux_score += 1
-        if "axe.run" in src_l or "accessibility" in src_l or "a11y" in src_l:
-            ux_score += 3
+                ux_score += w
+                reasons.append(f"UX code pattern '{p}' (+{w})")
+    except (OSError, TypeError, IOError):
+        pass
     except Exception:
         pass
+
+    # 5) steps analysis
     try:
         steps = test_steps or _test_steps.get(pretty_id, [])
         for s in steps:
-            sl = s.lower()
-            if any(k in sl for k in ["visual", "layout", "pixel", "screenshot", "css", "color"]):
-                ui_score += 2
-            if any(k in sl for k in ["flow", "scenario", "task", "usability", "accessibility", "a11y"]):
-                ux_score += 2
+            s_l = (s or "").lower()
+            for k, w in ui_keywords.items():
+                if word_in_text(k, s_l):
+                    ui_score += w
+                    reasons.append(f"UI step keyword '{k}' (+{w})")
+            for k, w in ux_keywords.items():
+                if word_in_text(k, s_l):
+                    ux_score += w
+                    reasons.append(f"UX step keyword '{k}' (+{w})")
     except Exception:
         pass
+
+    # 6) driver hints
     try:
         if driver_obj:
-            if "set_window_size" in src_l:
-                ui_score += 2
-            nav_count = 0
-            nav_count += src_l.count(".get(")
-            nav_count += src_l.count("current_url")
+            if "set_window_size" in src_l or ".screenshot" in src_l:
+                ui_score += 1
+                reasons.append("Driver presence & screenshot/window -> UI (+1)")
+            nav_count = src_l.count(".get(") + src_l.count("current_url") + src_l.count("title")
             if nav_count >= 2:
-                ux_score += 2
-            if "title" in src_l:
                 ux_score += 1
+                reasons.append(f"Found {nav_count} nav/title patterns -> UX (+1)")
     except Exception:
         pass
-    try:
-        assert_cnt = src_l.count("assert") if src_l else 0
-        if assert_cnt >= 3:
-            ux_score += 1
-    except Exception:
-        pass
-    # decision
+
+    # final decision
+    debug_text = f"ui_score={ui_score:.1f}; ux_score={ux_score:.1f}; reasons={' | '.join(reasons[:30])}"
     if ui_score == 0 and ux_score == 0:
-        return ""
-    if ui_score >= ux_score + 2:
-        return "UI"
-    if ux_score >= ui_score + 2:
-        return "UX"
+        # last resort: check test_case_desc
+        try:
+            td = (test_case_desc or "").lower()
+            for k in ui_keywords:
+                if word_in_text(k, td):
+                    return "UI", "Detected from description"
+            for k in ux_keywords:
+                if word_in_text(k, td):
+                    return "UX", "Detected from description"
+        except Exception:
+            pass
+        return "", debug_text
+
+    margin = 1.5
+    if ui_score >= ux_score + margin:
+        return "UI", debug_text
+    if ux_score >= ui_score + margin:
+        return "UX", debug_text
+    # close scores -> pick higher if any
     if ui_score > ux_score:
-        return "UI"
+        return "UI", debug_text
     if ux_score > ui_score:
-        return "UX"
-    low_desc = (test_case_desc or "").lower()
-    if any(k in low_desc for k in ["layout", "visual", "responsive", "pixel"]):
-        return "UI"
-    if any(k in low_desc for k in ["flow", "scenario", "task", "journey", "usability"]):
-        return "UX"
-    return ""
+        return "UX", debug_text
+    return "", debug_text
 
 
 # --------------------------
@@ -505,6 +562,7 @@ def pytest_runtest_makereport(item, call):
         test_case_doc = inspect.getdoc(getattr(item, "obj", None)) or ""
     except Exception:
         test_case_doc = ""
+    # screenshot handling
     screenshot_path = _test_screenshots.get(pretty_id, "")
     if not screenshot_path:
         driver_obj = getattr(item, "_driver", None) or item.funcargs.get("driver", None) or globals().get("_driver_instance", None)
@@ -533,6 +591,7 @@ def pytest_runtest_makereport(item, call):
                     print(f"[DEBUG] screenshot file not found after attempts: {screenshot_path}")
             except Exception as e:
                 print(f"[pytest] Failed to capture screenshot in makereport: {e}")
+
     test_steps = _test_steps.get(pretty_id, [])
     test_case_desc = "\n".join(test_steps) if test_steps else test_case_doc
     meta = extract_metadata_for_item(item, pretty_id)
@@ -541,16 +600,26 @@ def pytest_runtest_makereport(item, call):
     test_data_raw = meta.get("testdata_raw", "")
     parsed_kv = meta.get("testdata_kv", {})
     priority_value = meta.get("priority", "") or "Medium"
+
     driver_obj_for_detect = getattr(item, "_driver", None) or item.funcargs.get("driver", None) or globals().get("_driver_instance", None)
     auto_info = auto_detect_type_and_view(item, pretty_id, duration, driver_obj=driver_obj_for_detect, meta=meta, config=item.config)
-    category_value = auto_info.get("category", "")
+
+    # detect UI vs UX (improved version returns debug)
+    ui_or_ux, uiux_debug = detect_ui_or_ux(item, pretty_id, driver_obj=driver_obj_for_detect, meta=meta, test_steps=test_steps, test_case_desc=test_case_desc)
+
+    # Decide final Category: prefer ui_or_ux if available, otherwise use auto_info category
+    auto_category = auto_info.get("category", "") or ""
+    if ui_or_ux in ("UI", "UX"):
+        category_value = ui_or_ux
+    else:
+        category_value = auto_category
+
     view_value = meta.get("view") or auto_info.get("view", "")
     page_url_value = auto_info.get("page_url", "")
     page_title_value = auto_info.get("page_title", "")
-    # detect UI vs UX
-    ui_or_ux = detect_ui_or_ux(item, pretty_id, driver_obj=driver_obj_for_detect, meta=meta, test_steps=test_steps, test_case_desc=test_case_desc)
     result_status = "PASSED" if outcome_str == "passed" else "FAILED"
-    # base record
+
+    # Build the canonical record (only one Category column)
     record = {
         "ID": pretty_id,
         "Test Case Title": test_case_title,
@@ -568,13 +637,27 @@ def pytest_runtest_makereport(item, call):
         "View": view_value,
         "Category": category_value,
         "Page URL": page_url_value,
-        "Page Title": page_title_value,
-        "UI_or_UX": ui_or_ux
+        "Page Title": page_title_value
     }
+
+    # include TD_ fields from parsed_kv
     for k, v in parsed_kv.items():
         col_name = f"TD_{k}"
         record[col_name] = v
+
     _test_results.append(record)
+
+    # Optional: write UI/UX debug into a separate debug log file if env var set
+    try:
+        if os.environ.get("PYTEST_DEBUG_UIUX", "") == "1":
+            dbgfile = os.path.join(os.getcwd(), f"uiux_debug_{RUN_ID}.log")
+            try:
+                with open(dbgfile, "a", encoding="utf-8") as fh:
+                    fh.write(f"{pretty_id}\tcategory_auto={auto_category}\tui_or_ux={ui_or_ux}\tdebug={uiux_debug}\ttitle={test_case_title}\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # --------------------------
@@ -640,8 +723,7 @@ def pytest_sessionfinish(session, exitstatus):
         "View",
         "Category",
         "Page URL",
-        "Page Title",
-        "UI_or_UX"
+        "Page Title"
     ]
     td_cols = set()
     for r in _test_results:
@@ -656,3 +738,5 @@ def pytest_sessionfinish(session, exitstatus):
             df_new[c] = ""
     df_new = df_new[all_columns]
     save_to_excel(df_new)
+    print("\n[pytest] Kết quả đã được lưu vào test_results_master.xlsx")
+    
