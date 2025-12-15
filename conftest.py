@@ -20,13 +20,51 @@ import pandas as pd
 import pytest
 
 MASTER_FILE = os.path.join(os.getcwd(), "test_results_master.xlsx")
-TEMP_FILE = os.path.join(os.getcwd(), "test_results_temp.xlsx")
+TEMP_FILE = os.path.join(os.getcwd(), f"test_results_temp.xlsx")
 
 _test_results = []
 _test_steps = {}          # { pretty_id: [steps...] }
 _test_screenshots = {}    # { pretty_id: screenshot_path }
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 _driver_instance = None
+
+# Lock helpers: prefer `filelock` if available, otherwise fallback to simple lockfile
+def _acquire_lock(lock_path, timeout=30):
+    try:
+        from filelock import FileLock
+        lock = FileLock(lock_path, timeout=timeout)
+        lock.acquire()
+        return lock
+    except Exception:
+        # fallback: create a lock file atomically by O_EXCL
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                try:
+                    os.write(fd, str(os.getpid()).encode())
+                except Exception:
+                    pass
+                os.close(fd)
+                return lock_path
+            except FileExistsError:
+                time.sleep(0.5)
+        return None
+
+def _release_lock(lock):
+    try:
+        # filelock.FileLock
+        if hasattr(lock, 'release'):
+            lock.release()
+            return
+    except Exception:
+        pass
+    try:
+        # fallback path string
+        if isinstance(lock, str) and os.path.exists(lock):
+            os.remove(lock)
+    except Exception:
+        pass
 
 
 # --------------------------
@@ -664,27 +702,49 @@ def pytest_runtest_makereport(item, call):
 # Save to Excel (robust)
 # --------------------------
 def save_to_excel(df_new, retries=5):
+    temp_file = TEMP_FILE
+    lock_path = MASTER_FILE + ".lock"
     for attempt in range(retries):
         try:
-            df_new.to_excel(TEMP_FILE, index=False, engine="openpyxl")
-            if not os.path.exists(MASTER_FILE):
-                shutil.move(TEMP_FILE, MASTER_FILE)
-                print(f"\n[pytest] Created master file: {MASTER_FILE}")
-                return True
+            # write new results to a run-specific temp file first
+            df_new.to_excel(temp_file, index=False, engine="openpyxl")
+
+            # acquire lock before reading/writing master
+            lock = _acquire_lock(lock_path, timeout=10)
+            if not lock:
+                raise PermissionError("Could not acquire lock on master file")
             try:
-                df_old = pd.read_excel(MASTER_FILE, engine="openpyxl")
-                df_all = pd.concat([df_old, df_new], ignore_index=True, sort=False)
-            except Exception:
-                df_all = df_new
-            df_all.to_excel(MASTER_FILE, index=False, engine="openpyxl")
-            if os.path.exists(TEMP_FILE):
-                os.remove(TEMP_FILE)
-            print(f"\n[pytest] Updated master file: {MASTER_FILE}")
-            return True
+                if not os.path.exists(MASTER_FILE):
+                    # atomic move from temp to master
+                    shutil.move(temp_file, MASTER_FILE)
+                    print(f"\n[pytest] Created master file: {MASTER_FILE}")
+                    return True
+                try:
+                    df_old = pd.read_excel(MASTER_FILE, engine="openpyxl")
+                    df_all = pd.concat([df_old, df_new], ignore_index=True, sort=False)
+                except Exception:
+                    df_all = df_new
+
+                # write to a temporary master file then replace atomically
+                tmp_master = os.path.join(os.getcwd(), f"test_results_master_{RUN_ID}.xlsx")
+                df_all.to_excel(tmp_master, index=False, engine="openpyxl")
+                try:
+                    os.replace(tmp_master, MASTER_FILE)
+                except Exception:
+                    # fallback to overwrite
+                    df_all.to_excel(MASTER_FILE, index=False, engine="openpyxl")
+
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                print(f"\n[pytest] Updated master file: {MASTER_FILE}")
+                return True
+            finally:
+                _release_lock(lock)
         except PermissionError as e:
-            print(f"\n[pytest] Attempt {attempt + 1}/{retries}: File is locked: {e}")
+            print(f"\n[pytest] Attempt {attempt + 1}/{retries}: File is locked or lock failed: {e}")
             if attempt < retries - 1:
                 time.sleep(2)
+                continue
             else:
                 backup_file = os.path.join(os.getcwd(), f"test_results_backup_{RUN_ID}.xlsx")
                 try:
